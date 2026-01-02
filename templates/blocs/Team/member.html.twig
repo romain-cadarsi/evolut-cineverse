@@ -1,0 +1,44 @@
+{% from 'macros/blocs.html.twig' import title,subtitle,description,animation %}
+
+{% if member %}
+    <div class="team-member" {{ animation ?? null }}>
+        {% if member.images | length == 1 %}
+            <div class="team-image">
+                <img alt="{{ 'profile_picture_of' | trans }} {{ member.firstName }}" class="{{ html_classes({
+                    'rounded' : true,
+                    'rounded-circle' : rounded ?? false
+                }) }}" src="{{ member.image }}">
+            </div>
+        {% elseif member.images | length > 1 %}
+            <div class="carousel team-image" data-items="1" data-dots="false" data-adaptative-height="true">
+                {% for image in member.images %}
+                    <div class="team-image">
+                        <img alt="{{ "team_member_picture" | trans }}" class="rounded" src="{{ image.imageUrl }}">
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+        <div class="team-desc">
+            <span class="role">{{ "critique" | trans }}</span>
+            <h3>
+                <a href="{{ path('page_render',{'slug': 'critiques','author' : member.pseudo}) }}">{{ member.firstName }} {{ member.lastName }}</a>
+            </h3>
+            {{ title(member,'div',null,'span') }}
+            {{ description(member,'div',null) }}
+            {% if global_service.activePage %}
+                <span class="post-date">{{ "written_at" | trans }} {{ (global_service.activePage.remoteCreationDate ?? global_service.activePage.creationDate) | date('d-m-Y', 'Europe/Paris', 'fr') }}</span>
+            {% endif %}
+            {% if member.socialNetworks | length > 0 %}
+                <div class="align-center">
+                    {% for socialNetwork in member.socialNetworks %}
+                        <a class="btn btn-xs btn-slide btn-light" href="{{ socialNetwork.target }}"
+                           aria-label="{{ socialNetwork.title }}">
+                            {{ socialNetwork.icon | raw }}
+                            {{ title(socialNetwork,'div',null,'span') }}
+                        </a>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+    </div>
+{% endif %}
