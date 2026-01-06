@@ -6,12 +6,13 @@ use App\CommonCustomBase\Importer\AbstractImporter;
 use App\Entity\Remote\Security\Domain;
 use App\Entity\Remote\Security\User;
 use App\Service\EnvService;
+use App\Service\SessionContextService;
 use Doctrine\Common\Collections\ArrayCollection;
 
 class UserImporter extends AbstractImporter
 {
-    protected $importUsersUrl = "https://cineverse.fr/export_users.php";
-    protected $importSingleUserUrl = "https://cineverse.fr/export_users.php?id="; // Base URL for single user import
+    protected $importUsersUrl = "https://cineverse.fr/export_users.php?f";
+    protected $importSingleUserUrl = "https://cineverse.fr/export_users.php?f&id="; // Base URL for single user import
 
     private $USER_ROLES_MAPPING = [
         'author' => 'ROLE_AUTHOR',
@@ -28,7 +29,7 @@ class UserImporter extends AbstractImporter
      */
     function importAll(bool $sequential = false): bool
     {
-        $output = $this->getOutput();
+        $output = $this->getIO();
 
         $output?->title("Starting User import");
         $data = json_decode(file_get_contents($this->importUsersUrl), true);
@@ -53,7 +54,7 @@ class UserImporter extends AbstractImporter
      */
     public function import(mixed $id): bool
     {
-        $output = $this->getOutput();
+        $output = $this->getIO();
         $output?->title("Starting single user import for ID: $id");
 
         $url = $this->importSingleUserUrl . $id;
@@ -120,9 +121,11 @@ class UserImporter extends AbstractImporter
         }
 
         // Find existing user or create new one
-        $entity = $this->remoteEntityManager->getRepository(User::class)->findOneBy(['email' => $userData['email']]);
+        $entity = SessionContextService::getRepositoryFor(User::class)->findOneBy(['email' => $userData['email']]);
         if (!$entity) {
             $entity = new User();
+            SessionContextService::getManagerFor(User::class)->persist($entity);
+
         }
 
         // Update domains collection
@@ -132,7 +135,7 @@ class UserImporter extends AbstractImporter
 
         $userData['lastName'] = str_replace($userData['firstName'], '', $userData['fullName']);
         // Update user properties
-        $entity->setPseudo($userData['pseudo'])
+        $entity
             ->setFirstName(trim($userData['firstName']))
             ->setLastName(trim($userData['lastName'] ?? ""))
             ->setEmail(trim($userData['email']))
@@ -146,7 +149,7 @@ class UserImporter extends AbstractImporter
             ->setCustomPageModelUuids(['762ea469-90a5-43cb-a38c-918eae2d3eb6'])
             ->setRoles([$this->USER_ROLES_MAPPING[$userData['role']] ?? null]);
 
-        $this->remoteEntityManager->persist($entity);
+        $entity->getMapper()->setPseudo($userData['pseudo'])->map();
 
         return $entity;
     }

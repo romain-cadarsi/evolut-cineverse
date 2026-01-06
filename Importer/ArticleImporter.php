@@ -5,14 +5,14 @@ namespace App\CustomPageModel\Importer;
 use App\Client\Client;
 use App\CommonCustomBase\Importer\AbstractImporter;
 use App\CustomPageModel\Mapper\ArticleMapper;
+use App\Entity\Bloc\CustomPage;
 use App\Entity\Bloc\CustomPageModel;
 use App\Entity\Bloc\Page;
-use App\Entity\Bloc\WidgetElement;
 use App\Entity\General\Category;
 use App\Entity\General\Tag;
 use App\Entity\Remote\Security\User;
 use App\Message\CustomPageBatchImportMessage;
-use App\Serializer\SerializerGroupEnum;
+use App\Service\Cache\CacheManager;
 use App\Service\MediaTypeService;
 use App\Service\SessionContextEnum;
 use App\Service\SessionContextService;
@@ -20,20 +20,22 @@ use Doctrine\Common\Collections\ArrayCollection;
 use DOMDocument;
 use DOMElement;
 use DOMXPath;
+use Ramsey\Uuid\Uuid;
+use Symfony\Component\Cache\CacheItem;
 
 class ArticleImporter extends AbstractImporter
 {
     const CUSTOM_PAGE_MODEL_ID = 1;
-    protected $importUrl = "https://cineverse.fr/export.php";
+    protected $importUrl = "https://cineverse.fr/export.php?f";
     public $toPersistCategories = [];
     public $toPersistTags = [];
 
     function importAll(bool $sequential = false): bool
     {
-        $output = $this->getOutput();
+        $output = $this->getIO();
         $output?->title("Starting Cineverse article import");
 
-        $data = json_decode(file_get_contents($this->importUrl), true);
+        $data = json_decode($this->fetchAndCache('index.json', fn() => file_get_contents($this->importUrl)), true);
         $totalNumber = $data['total'];
         $limit = $data['limit'];
         $loadedCount = 0;
@@ -55,12 +57,12 @@ class ArticleImporter extends AbstractImporter
     function import(mixed $id): bool
     {
         self::setupImport();
-        SessionContextService::getSerializationContext()->add(SerializerGroupEnum::BridgeImport);
 
-        $data = file_get_contents($this->importUrl . "?postId=$id");
+        if (Uuid::isValid($id)) {
+            $customPage = SessionContextService::getRepositoryFor(CustomPage::class)->findOneBy(['uuid' => $id]) ?? SessionContextService::getRepositoryFor(CustomPage::class)->findOneBy(['remoteUuid' => $id]);
+        }
+        $data = $this->fetchAndCache("article_$id.json", fn() => file_get_contents($this->importUrl . "&postId=$id"));
         $this->importSingle($data);
-
-        SessionContextService::getSerializationContext()->remove(SerializerGroupEnum::BridgeImport);
 
         return true;
     }
@@ -68,10 +70,13 @@ class ArticleImporter extends AbstractImporter
     function importBatch(int $batchId = 0): bool
     {
         self::setupImport();
-        SessionContextService::getSerializationContext()->add(SerializerGroupEnum::BridgeImport);
 
-        $client = new Client('https://cineverse.fr');
-        $serializedData = $client->request("export.php?ff&page=$batchId", ['cineverse_import']);
+        $fetcher = function () use ($batchId) {
+            $client = new Client('https://cineverse.fr');
+            return $client->request("export.php?ff&page=$batchId", ['cineverse_import']);
+        };
+
+        $serializedData = $this->fetchAndCache("batch_$batchId.json", $fetcher);
         $deserializedData = json_decode($serializedData, true);
 
         foreach ($deserializedData['data'] as $data) {
@@ -79,48 +84,64 @@ class ArticleImporter extends AbstractImporter
         }
 
         unset($deserializedData, $serializedData);
-        SessionContextService::getSerializationContext()->remove(SerializerGroupEnum::BridgeImport);
         return true;
+    }
+
+    private function fetchAndCache(string $filename, callable $fetcher): string
+    {
+        return CacheManager::getValue($filename, function (CacheItem $cacheItem) use ($fetcher, $filename) {
+
+            $cacheItem->expiresAfter(3600);
+
+            $directory = $this->kernel->getProjectDir() . '/var/import/cineverse';
+            if (!is_dir($directory)) {
+                mkdir($directory, 0777, true);
+            }
+
+            $filepath = $directory . '/' . $filename;
+
+            $content = $fetcher();
+
+            if ($content) {
+                file_put_contents($filepath, $content);
+            }
+
+            return $content;
+        });
+
     }
 
     function importSingle($serializedData): Page
     {
         self::setupImport(); // Initialize context
-        $output = $this->getOutput();
+        $output = $this->getIO();
 
         // Process data
         $data = $this->processExternalData($serializedData);
-        $this->entityManager->flush();
+
+        SessionContextService::getManagerFor(CustomPage::class)->flush();
         $output?->note($data['ID']);
 
 
         // Find existing page or create new one
-        $page = $this->entityManager->getRepository(Page::class)->findOneBy(['remoteId' => $data['ID']]);
+        $page = SessionContextService::getRepositoryFor(CustomPage::class)->findOneBy(['remoteId' => $data['ID']]);
         if (!$page) {
-            $page = $this->getArticleCustomPageModel()->toPreview();
-            $this->entityManager->persist($page);
+            $page = (new CustomPage())->setCustomPageModel($this->getArticleCustomPageModel());
+            SessionContextService::getManagerFor(CustomPage::class)->persist($page);
         }
 
-        $iframes = [];
-        $i = 0;
-        foreach ($data['iframes'] as $src => $service) {
-            $i++;
-            $iframes[] = (new WidgetElement())
-                ->setBaseAdditionnalStyles(['rounded'])
-                ->setDescription("<iframe frameborder='0' allow='accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share' allowfullscreen data-src='$src' data-name='$service'></iframe>")
-                ->setOrdre($i);
-        }
-        $data['iframes'] = $iframes;
         unset($data['metas']);
         $data['authorId'] = $data['author']->getId();
         $mapper = new ArticleMapper($page, $data);
         $mapper->map();
         $page->setHidden(false)
-            ->setImported(true);
+            ->setImported(true)
+            ->setRemoteResourceId($data['ID']);
 
+        $page->save(false);
         $output?->note($page->getSlug());
-        $this->entityManager->flush();
-        $this->entityManager->clear();
+        SessionContextService::getManagerFor(CustomPage::class)->flush();
+        SessionContextService::getManagerFor(CustomPage::class)->clear();
 
         return $page;
     }
@@ -151,7 +172,12 @@ class ArticleImporter extends AbstractImporter
         $data = json_decode($serializedData, true);
 
         $data['articleContent'] = $this->cleanWordPressContent($data['articleContent']);
-        $data['iframes'] = $this->extractIframes($data['articleContent']);
+
+        $extractionResult = $this->extractIframes($data['articleContent']);
+        $data['articleContent'] = $extractionResult['html'];
+        $data['videos'] = $extractionResult['videos'];
+        $data['podcasts'] = $extractionResult['podcasts'];
+
         $data['articleContent'] = $this->stripHTMLTags(
             $data['articleContent'],
             ['a', 'strong', 'em', 'img', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'li']
@@ -192,7 +218,7 @@ class ArticleImporter extends AbstractImporter
         }
 
         if (str_starts_with($data['thumbnail'], 'http')) {
-            $report = $this->imageImporterService->importImagesFrom($data['thumbnail'], null, $data['ID']);
+            $report = $this->imageImporterService->importImagesFrom($data['thumbnail'], null, "articles/" . $data['ID']);
             foreach ($report['success'] as $success) {
                 $data['thumbnail'] = '/' . $success['relativePath'];
             }
@@ -243,21 +269,27 @@ class ArticleImporter extends AbstractImporter
         SessionContextService::setContext(SessionContextEnum::MANUAL_MEDIA_TYPE, MediaTypeService::DEFAULT_MEDIA_TYPE);
     }
 
-    private function extractIframes(string $baseData): ?array
+    private function extractIframes(string $baseData): array
     {
         $doc = new DOMDocument();
-        @$doc->loadHTML($baseData);
+        @$doc->loadHTML(mb_convert_encoding($baseData, 'HTML-ENTITIES', 'UTF-8'), LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         $xpath = new DOMXPath($doc);
 
         $iframeElements = $xpath->query("//iframe");
-        $results = [];
+        $videos = [];
+        $podcasts = [];
 
+        $iframes = [];
         foreach ($iframeElements as $iframe) {
+            $iframes[] = $iframe;
+        }
+
+        foreach ($iframes as $iframe) {
             if ($iframe->hasAttribute('src')) {
                 $src = $iframe->getAttribute('src');
 
                 $parsedUrl = parse_url($src);
-                $host = $parsedUrl['host'];
+                $host = $parsedUrl['host'] ?? '';
                 $parts = explode('.', $host);
 
                 // Déterminer le service en fonction du nom de domaine
@@ -270,13 +302,38 @@ class ArticleImporter extends AbstractImporter
                     $service = $parts[count($parts) - 2];
                 }
 
-                $results[$src] = $service;
-                unset($doc, $xpath);
+                $outerHtml = $doc->saveHTML($iframe);
+
+                if (in_array($service, ['youtube', 'dailymotion', 'vimeo'])) {
+                    $videos[] = $outerHtml;
+                    $placeholder = $doc->createElement('p', '[VIDEO]');
+                    if ($iframe->parentNode) {
+                        $iframe->parentNode->replaceChild($placeholder, $iframe);
+                    }
+                } elseif (in_array($service, ['spotify', 'deezer', 'soundcloud'])) {
+                    $podcasts[] = $outerHtml;
+                    $placeholder = $doc->createElement('p', '[PODCAST]');
+                    if ($iframe->parentNode) {
+                        $iframe->parentNode->replaceChild($placeholder, $iframe);
+                    }
+                } else {
+                    $videos[] = $outerHtml;
+                    $placeholder = $doc->createElement('p', '[VIDEO]');
+                    if ($iframe->parentNode) {
+                        $iframe->parentNode->replaceChild($placeholder, $iframe);
+                    }
+                }
             }
         }
+
+        $newHtml = $doc->saveHTML();
         unset($doc, $xpath);
 
-        return $results;
+        return [
+            'html' => $newHtml,
+            'videos' => $videos,
+            'podcasts' => $podcasts
+        ];
     }
 
     private function stripHTMLTags(string $data, array $stripAuthorizedTags): string
